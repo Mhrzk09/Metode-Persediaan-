@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <title>Perencanaan Persediaan - ABC, LTC, Wagner</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    table, th, td { border: 1px solid black; border-collapse: collapse; padding: 6px; }
+    table { margin-bottom: 20px; width: 100%; }
+    input[type="file"] { margin-bottom: 10px; }
+    .section { margin-bottom: 30px; }
+    .title { font-size: 20px; margin-bottom: 10px; font-weight: bold; }
+  </style>
+</head>
+<body>
+
+  <div class="section">
+    <div class="title">📁 Upload Data Excel</div>
+    <p><strong>Petunjuk Upload File Excel:</strong></p>
+    <ul>
+      <li><b>Nama</b>, <b>Harga</b>, <b>Buffer (%)</b>, <b>Biaya Pesan</b>, <b>Biaya Simpan</b></li>
+      <li><b>Masuk 1, Masuk 2, ...</b>: Barang masuk tiap periode</li>
+      <li><b>P1, P2, ...</b>: Permintaan barang per periode</li>
+    </ul>
+    <input type="file" id="excelFile" accept=".xlsx" />
+  </div>
+
+  <div class="section">
+    <div class="title">📊 Hasil Analisis ABC</div>
+    <div id="abcTable"></div>
+    <div id="selectedItem" style="margin-top: 10px;"></div>
+  </div>
+
+  <div class="section">
+    <div class="title">📦 Tabel Kebijakan LTC</div>
+    <div id="ltcTable"></div>
+  </div>
+
+  <div class="section">
+    <div class="title">🧾 Tabel Kebijakan Wagner</div>
+    <div id="wagnerTable"></div>
+  </div>
+
+  <div class="section">
+    <div class="title">📉 Grafik Perbandingan Total Ongkos</div>
+    <canvas id="biayaChart" width="400" height="200"></canvas>
+  </div>
+
+  <div>
+    <button onclick="downloadExcelCombined()">⬇️ Download Semua Hasil (.xlsx)</button>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
+  <script>
+    // variabel global
+    let latestLTC = null;
+    let latestWagner = null;
+    let latestABC = null;
+
+    document.getElementById('excelFile').addEventListener('change', function(e) {
+      const reader = new FileReader();
+      reader.onload = (evt) => {
+        const data = new Uint8Array(evt.target.result);
+        const workbook = XLSX.read(data, { type: 'array' });
+        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+        const json = XLSX.utils.sheet_to_json(sheet, { defval: 0 });
+        processData(json);
+      };
+      reader.readAsArrayBuffer(e.target.files[0]);
+    });
+    function processData(data) {
+      const items = data.map(row => {
+        const periods = Object.keys(row).filter(k => k.startsWith('P'));
+        const masukKeys = Object.keys(row).filter(k => k.startsWith('Masuk'));
+        const totalDemand = periods.reduce((sum, p) => sum + Number(row[p]), 0);
+        return {
+          name: row['Nama'],
+          harga: Number(row['Harga']),
+          buffer: Number(row['Buffer (%)']) / 100,
+          biayaPesan: Number(row['Biaya Pesan']),
+          biayaSimpan: Number(row['Biaya Simpan']),
+          demand: periods.map(p => Number(row[p])),
+          masuk: masukKeys.map(p => Number(row[p] || 0)),
+          nilai: Number(row['Harga']) * totalDemand
+        };
+      });
+
+      const sorted = [...items].sort((a, b) => b.nilai - a.nilai);
+      const totalNilai = sorted.reduce((sum, item) => sum + item.nilai, 0);
+      let akumulasi = 0;
+      sorted.forEach(item => {
+        akumulasi += item.nilai;
+        const p = akumulasi / totalNilai;
+        item.kategori = p <= 0.7 ? 'A' : p <= 0.9 ? 'B' : 'C';
+      });
+
+      renderABCTable(sorted);
+      latestABC = sorted;
+
+      const itemA = sorted.find(item => item.kategori === 'A');
+      if (!itemA) return;
+      document.getElementById("selectedItem").innerHTML = 
+        `<p>📌 Barang terpilih: <b>${itemA.name}</b> (Kategori A)</p>`;
+
+      const hasilLTC = hitungLTC(itemA.demand, itemA.harga, itemA.biayaPesan, itemA.biayaSimpan);
+      const hasilWagner = hitungWagner(itemA.demand, itemA.harga, itemA.biayaPesan, itemA.biayaSimpan);
+      renderPolicyTable(hasilLTC, itemA.demand, 'ltcTable');
+      renderPolicyTable(hasilWagner, itemA.demand, 'wagnerTable');
+
+      latestLTC = hasilLTC;
+      latestWagner = hasilWagner;
+      tampilkanGrafik(hasilLTC.ongkos.total, hasilWagner.ongkos.total);
+    }
+
+    function renderABCTable(data) {
+      let html = "<table><tr><th>Nama</th><th>Nilai</th><th>Kategori</th></tr>";
+      data.forEach(d => {
+        html += `<tr><td>${d.name}</td><td>${d.nilai.toFixed(2)}</td><td>${d.kategori}</td></tr>`;
+      });
+      html += "</table>";
+      document.getElementById('abcTable').innerHTML = html;
+    }
+
+    function renderPolicyTable(result, demand, containerId) {
+      let html = "<table><tr><th>Periode</th><th>Demand</th><th>Ukuran Lot</th><th>Waktu Pemesanan</th></tr>";
+      result.kebijakan.forEach((row, i) => {
+        html += `<tr><td>${row.periode}</td><td>${demand[i]}</td><td>${row.produksi}</td><td>${row.produksi > 0 ? 'Pesan' : '-'}</td></tr>`;
+        row.demand = demand[i];
+      });
+      html += "</table>";
+      html += `
+        <ul>
+          <li>🔹 Ongkos Pembelian: ${result.ongkos.pembelian.toFixed(2)}</li>
+          <li>📦 Ongkos Simpan: ${result.ongkos.simpan.toFixed(2)}</li>
+          <li>🧾 Ongkos Pesan: ${result.ongkos.pesan.toFixed(2)}</li>
+          <li><b>💰 Total Ongkos: ${result.ongkos.total.toFixed(2)}</b></li>
+        </ul>
+      `;
+      document.getElementById(containerId).innerHTML = html;
+    }
+
+    function tampilkanGrafik(ltc, wagner) {
+      const ctx = document.getElementById('biayaChart').getContext('2d');
+      new Chart(ctx, {
+        type: 'bar',
+        data: {
+          labels: ['LTC', 'Wagner-Whitin'],
+          datasets: [{
+            label: 'Total Ongkos (Rp)',
+            data: [ltc, wagner],
+            backgroundColor: ['skyblue', 'orange']
+          }]
+        },
+        options: {
+          responsive: true,
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              callbacks: {
+                label: (ctx) => 'Rp ' + ctx.raw.toLocaleString()
+              }
+            }
+          },
+          scales: {
+            y: {
+              beginAtZero: true,
+              ticks: {
+                callback: (val) => 'Rp ' + val.toLocaleString()
+              },
+              title: { display: true, text: 'Rupiah' }
+            }
+          }
+        }
+      });
+    }
+    function downloadExcelCombined() {
+      if (!latestLTC || !latestWagner || !latestABC) {
+        alert("Belum ada hasil yang bisa diunduh.");
+        return;
+      }
+
+      const abcData = latestABC.map(row => ({
+        "Nama": row.name,
+        "Nilai": row.nilai,
+        "Kategori": row.kategori
+      }));
+      const ltcData = latestLTC.kebijakan.map(row => ({
+        Periode: row.periode,
+        Demand: row.demand || 0,
+        "Ukuran Lot": row.produksi,
+        "Waktu Pemesanan": row.produksi > 0 ? "Pesan" : "-"
+      }));
+      const wagnerData = latestWagner.kebijakan.map(row => ({
+        Periode: row.periode,
+        Demand: row.demand || 0,
+        "Ukuran Lot": row.produksi,
+        "Waktu Pemesanan": row.produksi > 0 ? "Pesan" : "-"
+      }));
+
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(abcData), "ABC");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(ltcData), "LTC");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(wagnerData), "WAGNER");
+      XLSX.writeFile(wb, "hasil_abc_ltc_wagner.xlsx");
+    }
+
+    function hitungLTC(d, h, A, H) {
+      const n = d.length;
+      const c = Array(n).fill(Infinity), q = Array(n).fill(0), path = Array(n).fill(0);
+      c[-1] = 0;
+      for (let i = 0; i < n; i++) {
+        for (let j = 0; j <= i; j++) {
+          let jumlah = d.slice(j, i+1).reduce((a,b)=>a+b,0);
+          let simpan = 0;
+          for (let k = j; k < i; k++) {
+            simpan += d.slice(k+1,i+1).reduce((a,b)=>a+b,0)*H;
+          }
+          let biaya = (c[j-1] || 0) + A + simpan;
+          if (biaya < c[i]) {
+            c[i] = biaya;
+            path[i] = j;
+          }
+        }
+      }
+      const kebijakan = Array(n).fill({periode:0, produksi:0});
+      let i = n-1;
+      while (i >= 0) {
+        const j = path[i];
+        const lot = d.slice(j,i+1).reduce((a,b)=>a+b,0);
+        for (let k = j; k <= i; k++) {
+          kebijakan[k] = {periode:k+1, produksi: (k==j ? lot : 0)};
+        }
+        i = j - 1;
+      }
+      const pembelian = d.reduce((a,b)=>a+b,0)*h;
+      const pesan = A * kebijakan.filter(k=>k.produksi>0).length;
+      const simpan = c[n-1] - pesan;
+      return { kebijakan, ongkos: {pembelian, pesan, simpan, total: pembelian+pesan+simpan}};
+    }
+
+    function hitungWagner(d, h, A, H) {
+      const n = d.length;
+      const c = Array(n+1).fill(Infinity), r = Array(n+1).fill(0);
+      c[0] = 0;
+      for (let t = 1; t <= n; t++) {
+        for (let j = 0; j < t; j++) {
+          let simpan = 0;
+          for (let k = j; k < t-1; k++) {
+            simpan += d.slice(k+1, t).reduce((a,b)=>a+b,0)*H;
+          }
+          const total = c[j] + A + simpan;
+          if (total < c[t]) {
+            c[t] = total;
+            r[t] = j;
+          }
+        }
+      }
+      const kebijakan = Array(n).fill({periode:0, produksi:0});
+      let t = n;
+      while (t > 0) {
+        const j = r[t];
+        const lot = d.slice(j,t).reduce((a,b)=>a+b,0);
+        kebijakan[j] = {periode:j+1, produksi:lot};
+        for (let k = j+1; k < t; k++) kebijakan[k] = {periode:k+1, produksi:0};
+        t = j;
+      }
+      const pembelian = d.reduce((a,b)=>a+b,0)*h;
+      const pesan = A * kebijakan.filter(k=>k.produksi>0).length;
+      const simpan = c[n] - pesan;
+      return { kebijakan, ongkos: {pembelian, pesan, simpan, total: pembelian+pesan+simpan}};
+    }
+
+  </script>
+</body>
+</html>
